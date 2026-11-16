@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: SIS 3 messaging stack - SNS domain event, SQS queue with DLQ, idempotent Lambda consumer, DynamoDB table
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [dev, prod]
+    Default: dev
+
+Resources:
+  # ---- domain event: "OrderPlaced" is published to this topic -------------------------------
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: OrderEvents
+      Tags:
+        - { Key: Env, Value: !Ref Env }
+
+  # ---- queue + dead-letter queue --------------------------------------------------------------
+  OrdersDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600        # 14 days: longer than the source queue
+      SqsManagedSseEnabled: true
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      # >= 6 x function timeout (5 s) + batching window (5 s) = 35 s, 60 s leaves headroom
+      VisibilityTimeout: 60
+      ReceiveMessageWaitTimeSeconds: 20      # long polling
+      MessageRetentionPeriod: 345600         # 4 days
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+        maxReceiveCount: 5
+
+  OrdersQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref OrdersQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowOrderEventsTopic
+            Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrdersQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEventsTopic
+
+  OrdersSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: OrdersQueuePolicy
+    Properties:
+      TopicArn: !Ref OrderEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt OrdersQueue.Arn
+      RawMessageDelivery: true
+
+  # ---- the idempotency store: one item per orderId (the deduplication key) -------------------
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ---- consumer -----------------------------------------------------------------------------
+  ConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  ConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: consume-orders
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt OrdersQueue.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt OrdersTable.Arn
+
+  ConsumerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 5
+      MemorySize: 128
+      Role: !GetAtt ConsumerRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+      LoggingConfig:
+        LogGroup: !Ref ConsumerLogGroup
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          from botocore.exceptions import ClientError
+
+          TABLE = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+
+
+          def handler(event, context):
+              failed = []
+              for r in event["Records"]:
+                  try:
+                      body = json.loads(r["body"])
+                      order_id = str(body["orderId"])  # deduplication key: the business key
+                      TABLE.put_item(
+                          Item={"pk": "ORDER#" + order_id, "status": "PROCESSED",
+                                "total": str(body.get("total", "")),
+                                "messageId": r["messageId"]},
+                          ConditionExpression="attribute_not_exists(pk)",
+                      )
+                      print(json.dumps({"msg": "processed", "orderId": order_id}))
+                  except ClientError as e:
+                      if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                          print(json.dumps({"msg": "duplicate skipped", "orderId": order_id}))
+                      else:
+                          print(json.dumps({"msg": "error", "error": str(e), "messageId": r["messageId"]}))
+                          failed.append({"itemIdentifier": r["messageId"]})
+                  except Exception as e:
+                      print(json.dumps({"msg": "bad message", "error": str(e), "messageId": r["messageId"]}))
+                      failed.append({"itemIdentifier": r["messageId"]})
+              return {"batchItemFailures": failed}
+
+  ConsumerMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt OrdersQueue.Arn
+      FunctionName: !Ref ConsumerFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: 2
+      Enabled: true
+
+Outputs:
+  TopicArn:
+    Value: !Ref OrderEventsTopic
+    Export: { Name: !Sub "${AWS::StackName}-TopicArn" }
+  QueueUrl:
+    Value: !Ref OrdersQueue
+  DlqUrl:
+    Value: !Ref OrdersDLQ
+  TableName:
+    Value: !Ref OrdersTable
+  ConsumerLogGroup:
+    Value: !Ref ConsumerLogGroup
