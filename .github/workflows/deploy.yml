@@ -1,5 +1,5 @@
 
-name: AWS OIDC Test
+name: CAD Practice 7 CI/CD
 
 on:
   push:
@@ -10,13 +10,31 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: cad-production
+  cancel-in-progress: false
+
 jobs:
-  test-aws:
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r app/requirements.txt
+          pip install pytest
+
+      - name: Run Python tests
+        run: python -m pytest -q tests
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
@@ -24,5 +42,53 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Verify AWS connection
+      - name: Verify AWS identity
         run: aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REPO: 278387432427.dkr.ecr.us-east-1.amazonaws.com/cad-app-repository-vpb5k6iqbsbb
+        run: |
+          IMAGE="$ECR_REPO:$GITHUB_SHA"
+
+          if aws ecr describe-images \
+            --repository-name cad-app-repository-vpb5k6iqbsbb \
+            --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "Image already exists in ECR"
+          else
+            docker build --platform linux/amd64 -t "$IMAGE" app/
+            docker push "$IMAGE"
+          fi
+
+      - name: Deploy using CloudFormation
+        run: |
+          aws cloudformation deploy \
+            --stack-name cad-app \
+            --template-file infra/app.yaml \
+            --parameter-overrides \
+              Env=dev \
+              NetworkStackName=cad-network \
+              MessagingStackName=cad-messaging \
+              ImageTag="$GITHUB_SHA" \
+            --role-arn arn:aws:iam::278387432427:role/cad-cloudformation-deploy-role \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset \
+            --region us-east-1
+
+      - name: Verify deployment
+        run: |
+          URL=$(aws cloudformation describe-stacks \
+            --stack-name cad-app \
+            --query "Stacks[0].Outputs[?OutputKey=='ServiceUrl'].OutputValue" \
+            --output text)
+
+          echo "Application URL: $URL"
+
+          curl --fail --retry 5 --retry-delay 10 \
+            "${URL%/}/health"
+
+      - name: Print deployed image tag
+        run: echo "Deployed Git SHA $GITHUB_SHA"
