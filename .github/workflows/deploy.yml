@@ -82,7 +82,7 @@ jobs:
             --role-arn arn:aws:iam::278387432427:role/cad-cloudformation-deploy-role \
             --capabilities CAPABILITY_IAM \
             --no-fail-on-empty-changeset \
-            --no-execute-changeset \
+       
             --region us-east-1
 
 
