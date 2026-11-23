@@ -67,6 +67,7 @@ jobs:
             docker push "$IMAGE"
           fi
 
+
       - name: Deploy using CloudFormation
         run: |
           aws cloudformation deploy \
@@ -77,10 +78,12 @@ jobs:
               NetworkStackName=cad-network \
               MessagingStackName=cad-messaging \
               ImageTag="$GITHUB_SHA" \
+            --tags Project=cad-sis3 Env=dev \
             --role-arn arn:aws:iam::278387432427:role/cad-cloudformation-deploy-role \
             --capabilities CAPABILITY_IAM \
             --no-fail-on-empty-changeset \
             --region us-east-1
+
 
       - name: Verify deployment
         run: |
